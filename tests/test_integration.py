@@ -30,19 +30,28 @@ FAKE_HERDR = '''
 import json, os, time
 from pathlib import Path
 base = Path(os.environ['LINK_TEST_DIR'])
-(base / 'herdr-env.json').write_text(json.dumps(sorted(k for k in os.environ if k.startswith('ORCA_'))))
+(base / 'herdr-env.tmp').write_text(json.dumps(sorted(k for k in os.environ if k.startswith('ORCA_'))))
+os.replace(base / 'herdr-env.tmp', base / 'herdr-env.json')
 deadline = time.monotonic() + 60
 while not (base / 'release-herdr').exists() and time.monotonic() < deadline:
     time.sleep(0.05)
 '''
 
-# A linked command: writes its ORCA_* variables to argv[1] and exits with argv[2].
-DUMP_ENV = ('import json, os, sys; json.dump({k: v for k, v in os.environ.items() if k.startswith("ORCA_")}, '
-            'open(sys.argv[1], "w")); sys.exit(int(sys.argv[2]))')
+# A linked command, started by name: writes its ORCA_* variables to argv[1] and
+# exits with argv[2].
+DUMP_ENV = '''
+import json, os, sys
+with open(sys.argv[1], 'w') as out:
+    json.dump({k: v for k, v in os.environ.items() if k.startswith('ORCA_')}, out)
+sys.exit(int(sys.argv[2]))
+'''
 
-# A linked command: creates argv[1] when it starts, then waits for argv[2] to exist.
-WAIT = ('import os, sys, time; open(sys.argv[1], "w").close()\n'
-        'while not os.path.exists(sys.argv[2]): time.sleep(0.05)')
+# Stands in for the Orca CLI that a Herdr pane might find on PATH; it must never be used.
+DECOY = 'import sys; sys.exit(3)'
+
+# A linked command: creates argv[1] when it starts, then waits up to 60 s for argv[2].
+WAIT = ('import os, sys, time; open(sys.argv[1], "w").close(); deadline = time.monotonic() + 60\n'
+        'while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline: time.sleep(0.05)')
 
 def write_program(directory, name, source):
     """Create program ``name`` in ``directory`` that runs ``source`` with this Python."""
@@ -76,24 +85,34 @@ class EndToEndTests(unittest.TestCase):
         self.endpoint.touch()
         cli = write_program(bin_dir, 'orca-test', FAKE_ORCA)
         write_program(bin_dir, 'herdr', FAKE_HERDR)
+        write_program(bin_dir, 'dump-env', DUMP_ENV)
+        # Herdr panes find only these decoys on PATH, so consumers must use the CLI the
+        # binder recorded.
+        self.decoys = self.dir / 'decoys'
+        self.decoys.mkdir()
+        for name in ('orca', 'orca-ide'):
+            write_program(self.decoys, name, DECOY)
         # Nothing from the developer's own Orca, Herdr or home directory leaks in.
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ORCA_', 'HERDR_'))}
         env.update({
             'HOME': str(home), 'USERPROFILE': str(home),
             'XDG_RUNTIME_DIR': str(self.state), 'LOCALAPPDATA': str(self.state),
             'PATH': str(bin_dir) + os.pathsep + env.get('PATH', ''),
-            'ORCA_CLI_COMMAND': str(cli), 'PYTHONDONTWRITEBYTECODE': '1', 'LINK_TEST_DIR': str(self.dir),
+            'PYTHONDONTWRITEBYTECODE': '1', 'LINK_TEST_DIR': str(self.dir),
         })
         self.env = env
+        self.cli = str(cli)
         self.logs = []
 
     def binder_env(self):
         return {**self.env, 'ORCA_PANE_KEY': 'pane-1', 'ORCA_TAB_ID': 'tab-1', 'ORCA_TERMINAL_HANDLE': 'term-1',
-                'ORCA_AGENT_HOOK_ENDPOINT': str(self.endpoint), 'ORCA_AGENT_HOOK_TOKEN': 'secret'}
+                'ORCA_AGENT_HOOK_ENDPOINT': str(self.endpoint), 'ORCA_AGENT_HOOK_TOKEN': 'secret',
+                'ORCA_CLI_COMMAND': self.cli}
 
     def pane_env(self):
         """A Herdr pane whose server was started with another terminal's environment."""
-        return {**self.env, 'HERDR_ENV': '1', 'ORCA_PANE_KEY': 'stale', 'ORCA_AGENT_HOOK_TOKEN': 'leaked'}
+        return {**self.env, 'HERDR_ENV': '1', 'ORCA_PANE_KEY': 'stale', 'ORCA_AGENT_HOOK_TOKEN': 'leaked',
+                'PATH': str(self.decoys) + os.pathsep + self.env['PATH']}
 
     def start(self, args, env):
         log = self.dir / 'log-{}.txt'.format(len(self.logs))
@@ -131,19 +150,27 @@ class EndToEndTests(unittest.TestCase):
 
     def test_link_lifecycle(self):
         binder = self.start(['open', 'it'], self.binder_env())
+        self.addCleanup((self.dir / 'release-herdr').touch)
         self.wait_until((self.dir / 'herdr-env.json').exists, 'Herdr to start', binder)
         # Herdr gets no terminal identity, only installation-level variables.
         self.assertEqual(json.loads((self.dir / 'herdr-env.json').read_text()), ['ORCA_CLI_COMMAND'])
         self.assertNotIn('secret', self.link_file('it').read_text())
 
-        # A linked command gets exactly the link's variables and keeps its exit status.
+        # A linked command, found by name, gets exactly the link's variables and keeps its
+        # exit status; the Orca check uses the CLI recorded at bind time.
         dump = self.dir / 'child-env.json'
-        result = self.orca_link('--link', 'it', sys.executable, '-c', DUMP_ENV, str(dump), '7')
+        result = self.orca_link('--link', 'it', 'dump-env', str(dump), '7')
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(json.loads(dump.read_text()), {
             'ORCA_PANE_KEY': 'pane-1', 'ORCA_TAB_ID': 'tab-1', 'ORCA_TERMINAL_HANDLE': 'term-1',
-            'ORCA_AGENT_HOOK_ENDPOINT': str(self.endpoint), 'ORCA_CLI_COMMAND': self.env['ORCA_CLI_COMMAND']})
+            'ORCA_AGENT_HOOK_ENDPOINT': str(self.endpoint)})
         self.assertIn('Stop the Herdr server', result.stderr)
+        if os.name == 'nt':
+            # dump-env is a .cmd file there, and cmd.exe would split this argument.
+            refused = self.dir / 'refused.json'
+            result = self.orca_link('--link', 'it', 'dump-env', str(refused), 'a&b')
+            self.assertEqual(result.returncode, 126, result.stderr)
+            self.assertFalse(refused.exists())
 
         # Without a name, only the link's own project finds it.
         self.assertEqual(self.orca_link('check').returncode, 0)
@@ -154,10 +181,12 @@ class EndToEndTests(unittest.TestCase):
         # Closing Herdr while a command runs keeps the binding until the command exits.
         started, release = self.dir / 'started', self.dir / 'release'
         consumer = self.start(['--link', 'it', sys.executable, '-c', WAIT, str(started), str(release)], self.pane_env())
+        self.addCleanup(release.touch)
         self.wait_until(started.exists, 'the command to start', consumer)
         self.assertIn('already in use', self.orca_link('--link', 'it', sys.executable, '-c', 'pass').stderr)
         (self.dir / 'release-herdr').touch()
-        time.sleep(1.5)
+        self.wait_until(lambda: 'Herdr client closed' in self.output(), 'Herdr to close', binder)
+        time.sleep(1.5)  # longer than the binder's 1 s check for a running command
         self.assertIsNone(binder.poll(), 'the binding closed while its command was running')
         release.touch()
         self.assertEqual(consumer.wait(timeout=30), 0)
@@ -172,7 +201,7 @@ class EndToEndTests(unittest.TestCase):
         binder.kill()
         binder.wait(timeout=10)
         # Windows releases a dead process's locks after a short delay.
-        self.wait_until(lambda: self.orca_link('check', 'it').returncode == 1, 'the link to close')
+        self.wait_until(lambda: 'not live' in self.orca_link('check', 'it').stderr, 'the link to close')
 
     @unittest.skipIf(os.name == 'nt', 'sends POSIX signals')
     def test_ctrl_c_does_not_end_a_consumer_before_its_command(self):
@@ -180,6 +209,7 @@ class EndToEndTests(unittest.TestCase):
         self.wait_until(self.link_file('it').exists, 'the binding', binder)
         started, release = self.dir / 'started', self.dir / 'release'
         consumer = self.start(['--link', 'it', sys.executable, '-c', WAIT, str(started), str(release)], self.pane_env())
+        self.addCleanup(release.touch)
         self.wait_until(started.exists, 'the command to start', consumer)
         for _ in range(2):
             consumer.send_signal(signal.SIGINT)
@@ -188,6 +218,14 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn('already in use', self.orca_link('--link', 'it', sys.executable, '-c', 'pass').stderr)
         release.touch()
         self.assertEqual(consumer.wait(timeout=30), 0)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows exit codes')
+    def test_windows_exit_codes_pass_through(self):
+        binder = self.start(['bind', 'it'], self.binder_env())
+        self.wait_until(self.link_file('it').exists, 'the binding', binder)
+        # 0xC000013A is what a console program reports when Ctrl-C ends it.
+        result = self.orca_link('--link', 'it', sys.executable, '-c', 'import os; os._exit(0xC000013A - 2**32)')
+        self.assertEqual(result.returncode, 0xC000013A, result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

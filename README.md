@@ -23,8 +23,8 @@ identity, so agents started in Herdr without orca-link cannot report to the wron
 - Linux, macOS or Windows (see [Windows](#windows)).
 - Orca with its agent hooks enabled. Orca then sets `ORCA_AGENT_HOOK_ENDPOINT` in its terminals.
 - The Orca command-line tool on `PATH` in the Orca terminal where you bind: `orca-ide` on Linux,
-  `orca` on macOS and Windows. orca-link records its path for the commands it starts in Herdr. To
-  use another name or path, set `ORCA_CLI_COMMAND` before binding.
+  `orca` on macOS and Windows. orca-link records its path, so that runs in Herdr panes can use it.
+  To use another name or path, set `ORCA_CLI_COMMAND` before binding.
 - [Herdr](https://herdr.dev).
 - [uv](https://docs.astral.sh/uv/) (recommended) or pipx. orca-link needs Python 3.11 or newer and has
   no third-party dependencies.
@@ -95,10 +95,10 @@ orca-link my-launcher --some-option
   `ORCA_USER_DATA_PATH` when the link has none).
 - Before each command starts, orca-link checks the link's Orca terminal with the Orca CLI. If Orca has
   restarted or the terminal is gone, bind again in a new Orca terminal.
-- `orca-link COMMAND` exits with the command's exit status: on Linux and macOS 128 + N if signal N
-  ended it, 127 if the command was not found, and 126 if it could not be started. `Ctrl-C` (and
-  `Ctrl-Break` on Windows) reaches the command; orca-link ignores it and keeps waiting until the
-  command exits.
+- `orca-link COMMAND` exits with the command's exit status: 128 + N if signal N ended it (Linux and
+  macOS), 127 if the command was not found, and 126 if it could not be started or, on Windows, a
+  batch file's arguments were refused. `Ctrl-C` (and `Ctrl-Break` on Windows) reaches the command;
+  orca-link ignores it and keeps waiting until the command exits.
 - When you close Herdr after `open`, the binding closes once no linked command is running. After
   that, or with `bind`, `Ctrl-C` in the binding terminal closes the binding at once; while Herdr is
   open there, `Ctrl-C` goes to Herdr. Linked commands keep running after their binding closes, but
@@ -127,19 +127,21 @@ orca-link my-launcher --some-option
 
 ## Windows
 
-Native Windows works with Herdr's Windows build. Install orca-link with uv as above, run
-`uv tool update-shell` so that uv's tool directory is on your user `PATH`, and register Orca's
-command-line tool in Orca's settings so that `orca` is on your user `PATH` too.
+orca-link supports native Windows with Herdr's Windows build. Install orca-link with uv as above and
+run `uv tool update-shell`, so that uv's tool directory is on your user `PATH`. Orca's command-line
+tool must be on `PATH` in the Orca terminal where you bind; Orca can register it on your user
+`PATH`. The behavior and limitations described above apply on Windows too.
 
-- Herdr panes take `PATH` from the user and system environment settings, not from the terminal that
-  started Herdr. A directory added to `PATH` only in one shell is not visible in Herdr panes; restart
-  the Herdr server after changing `PATH`.
+- Herdr panes may not see `PATH` changes made only in one shell: on Windows, Herdr 0.9.3 builds a
+  pane's `PATH` from the user and system environment settings. If a program is not found in Herdr
+  panes, add its directory to your user `PATH` and restart the Herdr server.
 - Commands are looked up only in the `PATH` directories, never in the current directory, and only
   `.com`, `.exe`, `.bat` and `.cmd` files count.
 - Windows runs `.bat` and `.cmd` files, such as the launchers npm installs, through cmd.exe, which
-  reinterprets some characters in their arguments. orca-link refuses to pass an argument containing
-  `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(` or `)` to such a file; use a native executable, such as
-  the one Claude Code's native installer provides, or leave those characters out.
+  reinterprets some characters in their command line. orca-link refuses to run such a file with an
+  argument containing `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(`, `)` or a line break, or from a
+  path containing `%` or `!`. Use a native executable, such as the one Claude Code's native installer
+  provides, or leave those characters out.
 - CI runs the tests on Windows, including end-to-end tests with stand-ins for Orca and Herdr.
   orca-link has not been tested with a real Orca and Herdr on Windows.
 

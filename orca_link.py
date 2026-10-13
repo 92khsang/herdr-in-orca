@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 if os.name == 'nt':
@@ -40,8 +41,12 @@ LOCK_RETRIES = 3
 NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 # Program files that CreateProcess can start on Windows.
 WINDOWS_RUNNABLE = ('.com', '.exe', '.bat', '.cmd')
-# Characters that cmd.exe reinterprets in the arguments of a .bat or .cmd file.
+# Characters that cmd.exe reinterprets in the arguments of a .bat or .cmd file, and
+# those it still expands inside the quotes that always surround the file's path.
 BATCH_UNSAFE = frozenset('"%!^&|<>()\r\n\0')
+BATCH_PATH_UNSAFE = frozenset('"%!\r\n\0')
+# Windows device names, which cannot name a link's state files there.
+RESERVED_NAMES = re.compile(r'(con|prn|aux|nul|com[0-9]|lpt[0-9])', re.IGNORECASE)
 
 def clean_environ():
     """Return a copy of this process's environment without terminal-specific ORCA_* values."""
@@ -54,10 +59,9 @@ def resolve_executable(name, path=None):
     and only .com, .exe, .bat and .cmd files count, so a project cannot shadow a
     tool and extensionless shell shims are skipped.
     """
-    if path is None:
-        path = os.environ.get('PATH', '')
     if os.name == 'nt':
-        return windows_executable(name, path, os.environ.get('PATHEXT', ''))
+        return windows_executable(name, os.environ.get('PATH', '') if path is None else path,
+                                  os.environ.get('PATHEXT', ''))
     found = shutil.which(name, path=path)
     return os.path.abspath(found) if found else None
 
@@ -72,21 +76,45 @@ def windows_executable(name, path, pathext, isfile=os.path.isfile):
         return next((ntpath.abspath(c) for c in candidates(name) if isfile(c)), None)
     for directory in path.split(';'):
         directory = directory.strip().strip('"')
-        if directory and ntpath.isabs(directory):
+        # Only entries with a drive or UNC share are searched; "." and relative or
+        # drive-relative entries would depend on the current directory.
+        if ntpath.splitdrive(directory)[0] and ntpath.isabs(directory):
             for candidate in candidates(ntpath.join(directory, name)):
                 if isfile(candidate):
                     return candidate
     return None
 
+def is_batch(program):
+    return ntpath.splitext(program)[1].lower() in ('.bat', '.cmd')
+
 def unsafe_batch_argument(program, args):
     """Return the first of ``program`` and ``args`` that cmd.exe would reinterpret, or None.
 
     Only .bat and .cmd programs are affected: Windows runs them through cmd.exe,
-    which parses their command line again.
+    which parses their command line again. command_line() always quotes their
+    path, so only ``%`` and ``!`` (and line breaks) are a problem there.
     """
-    if ntpath.splitext(program)[1].lower() not in ('.bat', '.cmd'):
+    if not is_batch(program):
         return None
-    return next((arg for arg in [program, *args] if BATCH_UNSAFE & set(arg)), None)
+    if BATCH_PATH_UNSAFE & set(program):
+        return program
+    return next((arg for arg in args if BATCH_UNSAFE & set(arg)), None)
+
+def command_line(program, args):
+    """Return the ``args`` for Popen that start ``program`` with ``args``.
+
+    On Windows a .bat or .cmd file's path is always quoted, because cmd.exe
+    parses its command line again and list2cmdline quotes only paths with spaces.
+    """
+    if os.name == 'nt' and is_batch(program):
+        return ' '.join(['"' + program + '"', subprocess.list2cmdline(args)]).rstrip()
+    return [program, *args]
+
+def absolute(path):
+    """Return whether ``path`` is absolute, with a drive or share on Windows."""
+    if os.name == 'nt':
+        return bool(ntpath.splitdrive(path)[0]) and ntpath.isabs(path)
+    return os.path.isabs(path)
 
 def herdr_program():
     program = resolve_executable('herdr')
@@ -161,14 +189,25 @@ def rpc(*args, env=None, program=None):
         RuntimeError: If the CLI is missing, does not answer with a JSON object,
             or reports an error.
     """
-    p = subprocess.run([program or cli(env), *args, '--json'], capture_output=True, timeout=10, env=env)
+    # The reply goes to a file rather than a pipe: a CLI started through a .cmd file
+    # runs in a child process that would keep a pipe open after a timeout.
+    with tempfile.TemporaryFile() as out:
+        p = subprocess.Popen(command_line(program or cli(env), [*args, '--json']), stdin=subprocess.DEVNULL,
+                             stdout=out, stderr=subprocess.DEVNULL, env=env)
+        try:
+            returncode = p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            kill_tree(p)
+            raise RuntimeError('Orca CLI did not answer within 10 seconds') from None
+        out.seek(0)
+        stdout = out.read()
     try:
-        reply = json.loads(p.stdout)
+        reply = json.loads(stdout)
     except ValueError:
         reply = None
     if not isinstance(reply, dict):
         raise RuntimeError('Orca CLI did not return JSON')
-    if p.returncode or not reply.get('ok'):
+    if returncode or not reply.get('ok'):
         error = reply.get('error')
         code = error.get('code') if isinstance(error, dict) else None
         if code in GONE_CODES:
@@ -177,6 +216,15 @@ def rpc(*args, env=None, program=None):
             raise RuntimeError('Orca is not running or cannot be reached')
         raise RuntimeError('Orca CLI failed' + (' (' + code + ')' if isinstance(code, str) else ''))
     return reply
+
+def kill_tree(p):
+    """Kill process ``p`` and, on Windows, the processes it started."""
+    if os.name == 'nt':
+        taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+        subprocess.run([taskkill, '/F', '/T', '/PID', str(p.pid)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+    p.kill()
+    p.wait()
 
 def runtime_id(reply):
     """Return the Orca runtime id from a CLI reply, or None."""
@@ -298,7 +346,7 @@ def attach_existing(name):
     print(f'Reopening Herdr for existing link: {name}. Select your workspace in Herdr.', flush=True)
     print('Existing commands keep their original Orca hook target; this does not move them to this terminal.', flush=True)
     try:
-        subprocess.run([herdr], env=clean_environ(), check=False)
+        subprocess.run(command_line(herdr, []), env=clean_environ(), check=False)
     except KeyboardInterrupt:
         pass
 
@@ -360,7 +408,7 @@ def bind_new(root, name, open_herdr):
         print('Keep this terminal open for hook updates. Ctrl-C closes the binding without stopping the linked command.', flush=True)
         try:
             if open_herdr:
-                subprocess.run([herdr], env=clean_environ(), check=False)
+                subprocess.run(command_line(herdr, []), env=clean_environ(), check=False)
                 print('Herdr client closed. Waiting only if a linked command is still running.', flush=True)
             while True:
                 if open_herdr:
@@ -415,7 +463,8 @@ def context(root, name):
     env.update({k: v for k, v in data['env'].items() if k in KEYS})
     rebind = 'run orca-link open ' + name + ' in a new Orca terminal'
     # Prefer the CLI the binder found; it may be missing after an Orca update.
-    program = data.get('cli') if data.get('cli') and os.path.isfile(data['cli']) else None
+    recorded = data.get('cli')
+    program = resolve_executable(recorded) if recorded and absolute(recorded) else None
     try:
         receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'], env=env, program=program)
     except TerminalGone:
@@ -480,12 +529,14 @@ def wait_for(root, name, command, env):
         unsafe = unsafe_batch_argument(program, command[1:])
         if unsafe is not None:
             print('orca-link: cannot run ' + command[0] + ': it is a batch file, and cmd.exe would '
-                  'reinterpret ' + repr(unsafe) + '; use a native executable or avoid the characters '
-                  '" % ! ^ & | < > ( )', file=sys.stderr)
+                  'reinterpret ' + repr(unsafe) + '; use a native executable, or keep " % ! ^ & | < > ( ) '
+                  'and line breaks out of its arguments and % and ! out of its path', file=sys.stderr)
             return 126
-        command = [program, *command[1:]]
+        args = command_line(program, command[1:])
+    else:
+        args = command
     try:
-        p = subprocess.Popen(command, env=env)
+        p = subprocess.Popen(args, env=env)
     except FileNotFoundError:
         print('orca-link: command not found: ' + command[0], file=sys.stderr)
         return 127
@@ -550,6 +601,8 @@ def _main(argv):
         name = a.link
     if name is not None and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name):
         parser.error('name must contain 1-40 letters, digits, hyphens or underscores')
+    if name is not None and RESERVED_NAMES.fullmatch(name):
+        parser.error(name + ' is a reserved device name on Windows')
     root = directory()
     if name is None and action == 'open':
         # Reopen this project's live link when there is one; reopening any of
