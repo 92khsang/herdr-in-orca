@@ -6,6 +6,7 @@ daemon runs.
 """
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,49 +18,73 @@ import time
 
 __version__ = '0.1.0.dev0'
 
-KEYS = ('ORCA_PANE_KEY', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID',
+# Captured from the binding terminal and set for every linked command.
+KEYS = ('ORCA_PANE_KEY', 'ORCA_AGENT_PANE', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID',
         'ORCA_WORKSPACE_ID', 'ORCA_TERMINAL_HANDLE', 'ORCA_AGENT_HOOK_ENDPOINT',
-        'ORCA_AGENT_HOOK_ENV', 'ORCA_AGENT_HOOK_VERSION', 'ORCA_AGENT_HOOK_ROOT')
+        'ORCA_AGENT_HOOK_ENV', 'ORCA_AGENT_HOOK_VERSION', 'ORCA_AGENT_HOOK_ROOT',
+        'ORCA_USER_DATA_PATH')
+# ORCA_* variables that locate the Orca installation rather than one terminal. They
+# are the only ORCA_* values passed on from the caller to Herdr and linked commands.
+INSTALL_KEYS = ('ORCA_USER_DATA_PATH', 'ORCA_CLI_COMMAND', 'ORCA_CLI_BIN_DIR', 'ORCA_WSL_CLI_DIR')
+
+def clean_environ():
+    """Return a copy of this process's environment without terminal-specific ORCA_* values."""
+    return {k: v for k, v in os.environ.items() if not k.startswith('ORCA_') or k in INSTALL_KEYS}
 
 def project_root():
     if shutil.which('git'):
-        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
+                                env=clean_environ())
         if result.returncode == 0:
             return Path(result.stdout.strip()).resolve()
     return Path.cwd().resolve()
 
 def project_name():
+    """Return the default link name: the project directory name and a hash of its path."""
     root = project_root()
-    name = re.sub(r'[^A-Za-z0-9_-]+', '-', root.name).strip('-')
-    if not name:
-        import hashlib
-        name = 'project-' + hashlib.sha256(str(root).encode()).hexdigest()[:8]
-    return name[:40]
+    base = re.sub(r'[^A-Za-z0-9_-]+', '-', root.name).strip('-')[:31] or 'project'
+    return base + '-' + hashlib.sha256(os.fsencode(os.path.normcase(str(root)))).hexdigest()[:8]
 
-def project_link(root):
+def project_links(root):
+    """Return the sorted names of the live links bound in the current project."""
     project = str(project_root())
     matches = []
     for path in root.glob('*.json'):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', path.stem) or not is_bound(root, path.stem):
             continue
         try:
-            if json.loads(path.read_text()).get('project') == project:
-                matches.append(path.stem)
+            data = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-    if len(matches) > 1:
-        raise RuntimeError('Multiple links for this project. Use orca-link --link NAME COMMAND: ' + ', '.join(matches))
-    return matches[0] if matches else project_name()
+        if isinstance(data, dict) and data.get('project') == project:
+            matches.append(path.stem)
+    return sorted(matches)
 
-def cli():
-    value = os.environ.get('ORCA_CLI_COMMAND') or ('orca-ide' if sys.platform.startswith('linux') else 'orca')
-    result = shutil.which(value)
+def project_link(root, usage):
+    """Return the only live link bound in the current project.
+
+    Raises:
+        RuntimeError: If no live link or several live links match; the message
+            suggests ``usage`` for naming a link explicitly.
+    """
+    links = project_links(root)
+    if len(links) == 1:
+        return links[0]
+    project = str(project_root())
+    if links:
+        raise RuntimeError('Several live links belong to ' + project + ' (' + ', '.join(links) + '); use ' + usage)
+    raise RuntimeError('No live link for ' + project + '; run orca-link in an Orca terminal in this project, or use ' + usage)
+
+def cli(env=None):
+    env = os.environ if env is None else env
+    value = env.get('ORCA_CLI_COMMAND') or ('orca-ide' if sys.platform.startswith('linux') else 'orca')
+    result = shutil.which(value, path=env.get('PATH'))
     if not result:
         raise RuntimeError('Orca CLI not found: ' + value)
     return result
 
-def rpc(*args):
-    p = subprocess.run([cli(), *args, '--json'], capture_output=True, text=True, timeout=10)
+def rpc(*args, env=None):
+    p = subprocess.run([cli(env), *args, '--json'], capture_output=True, text=True, timeout=10, env=env)
     try:
         d = json.loads(p.stdout)
     except ValueError:
@@ -97,7 +122,7 @@ def attach_existing(name):
     print(f'Reopening Herdr for existing link: {name}. Select your workspace in Herdr.', flush=True)
     print('Existing commands keep their original Orca hook target; this does not move them to this terminal.', flush=True)
     try:
-        subprocess.run(['herdr'], check=False)
+        subprocess.run(['herdr'], env=clean_environ(), check=False)
     except KeyboardInterrupt:
         pass
 
@@ -133,9 +158,9 @@ def bind_new(root, name, open_herdr):
     env = {k: os.environ[k] for k in KEYS if os.environ.get(k)}
     if not env.get('ORCA_TERMINAL_HANDLE'):
         raise RuntimeError('Orca terminal handle is missing')
-    receipt = rpc('terminal', 'show', '--terminal', env['ORCA_TERMINAL_HANDLE'])
+    # Check the terminal with the environment that consumers will use.
+    receipt = rpc('terminal', 'show', '--terminal', env['ORCA_TERMINAL_HANDLE'], env={**clean_environ(), **env})
     # One Orca terminal backs at most one link.
-    import hashlib
     target = hashlib.sha256(env['ORCA_PANE_KEY'].encode()).hexdigest()
     with locked(root / (target + '.target.lock')):
         path = root / (name + '.json')
@@ -147,7 +172,7 @@ def bind_new(root, name, open_herdr):
         print('Keep this terminal open for hook updates. Ctrl-C closes the binding without stopping the linked command.', flush=True)
         try:
             if open_herdr:
-                subprocess.run(['herdr'], check=False)
+                subprocess.run(['herdr'], env=clean_environ(), check=False)
                 print('Herdr client closed. Waiting only if a linked command is still running.', flush=True)
             while True:
                 if open_herdr:
@@ -171,18 +196,33 @@ def context(root, name):
     if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
         raise RuntimeError('Link file is not private')
     data = json.loads(path.read_text())
-    receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'])
+    # Pass the caller's environment through (Herdr variables, credentials); the
+    # terminal's ORCA_* values come from the link. The Orca CLI runs with the same
+    # environment, so it reaches the Orca instance that issued the terminal handle.
+    env = clean_environ()
+    env.update({k: v for k, v in data['env'].items() if k in KEYS})
+    receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'], env=env)
     if data.get('runtime') != receipt.get('_meta', {}).get('runtimeId'):
         raise RuntimeError('Orca restarted; bind again')
-    # Pass the caller's environment through (Herdr variables, credentials); every
-    # ORCA_* value comes from the link instead.
-    env = {k: v for k, v in os.environ.items() if not k.startswith('ORCA_')}
-    env.update({k: v for k, v in data['env'].items() if k in KEYS})
+    warn_inherited_identity(env.get('ORCA_PANE_KEY'))
     # Codex's installed hook guard requires a hook root before loading endpoint.env.
     native_root = Path.home() / '.orca'
     if not env.get('ORCA_AGENT_HOOK_ROOT') and (native_root / 'agent-hooks/codex-hook.sh').is_file():
         env['ORCA_AGENT_HOOK_ROOT'] = str(native_root)
     return env
+
+def warn_inherited_identity(linked_pane_key):
+    """Note when this Herdr pane carries another Orca terminal's identity.
+
+    A pane inherits the environment of the client that started its Herdr server.
+    A pane key equal to the link's comes from orca-link itself, for example in a
+    shell started through orca-link, and is not reported.
+    """
+    pane_key = os.environ.get('ORCA_PANE_KEY')
+    if os.environ.get('HERDR_ENV') == '1' and pane_key and pane_key != linked_pane_key:
+        print("orca-link: note: this Herdr server was started with another Orca terminal's environment, "
+              'so commands started here without orca-link report to that terminal. Stop the Herdr '
+              'server and start it again with `orca-link open` to fix this.', file=sys.stderr)
 
 def run(root, name, command):
     if not command:
@@ -208,7 +248,7 @@ def _main(argv):
     parser = argparse.ArgumentParser(
         prog='orca-link',
         description="Wrap any command with the current project's Orca hook context.",
-        usage='orca-link [--link NAME] COMMAND [ARGS...] | open [NAME] | bind NAME | run NAME COMMAND [ARGS...] | check NAME',
+        usage='orca-link [--link NAME] COMMAND [ARGS...] | open [NAME] | bind NAME | run NAME COMMAND [ARGS...] | check [NAME]',
         epilog='In an Orca terminal: orca-link open. In a Herdr pane: orca-link COMMAND. Use -- before commands named open, bind, run or check.')
     parser.add_argument('--version', action='version', version='orca-link ' + __version__)
     parser.add_argument('--link', metavar='NAME', help='Use the link named NAME instead of the one matched to the current project')
@@ -222,14 +262,14 @@ def _main(argv):
     if argv[0] in builtins:
         action = argv[0]
         sub = argparse.ArgumentParser(prog='orca-link ' + action)
-        if action == 'open':
+        if action in ('open', 'check'):
             sub.add_argument('name', nargs='?', default=None)
         else:
             sub.add_argument('name')
         if action == 'run':
             sub.add_argument('command', nargs=argparse.REMAINDER)
         a = sub.parse_args(argv[1:])
-        name = a.name if a.name is not None else project_name()
+        name = a.name
         command = a.command if action == 'run' else []
         if command[:1] == ['--']:
             command = command[1:]
@@ -247,8 +287,14 @@ def _main(argv):
     if name is not None and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name):
         parser.error('name must contain 1-40 letters, digits, hyphens or underscores')
     root = directory()
-    if name is None:
-        name = project_link(root)
+    if name is None and action == 'open':
+        # Reopen this project's live link when there is one; reopening any of
+        # several is fine because it only attaches another Herdr client.
+        links = project_links(root)
+        default = project_name()
+        name = default if not links or default in links else links[0]
+    elif name is None:
+        name = project_link(root, 'orca-link check NAME' if action == 'check' else 'orca-link --link NAME COMMAND')
     if action in ('bind', 'open'):
         bind(root, name, open_herdr=action == 'open')
     elif action == 'run':
