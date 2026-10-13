@@ -24,7 +24,7 @@ if os.name == 'nt':
 else:
     import fcntl
 
-__version__ = '0.1.0.dev0'
+__version__ = '0.1.0'
 
 # Captured from the binding terminal and set for every linked command.
 KEYS = ('ORCA_PANE_KEY', 'ORCA_AGENT_PANE', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID',
