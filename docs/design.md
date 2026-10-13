@@ -43,7 +43,8 @@ holds:
 | `NAME.json` | Written by the binder: the captured variables, Orca's runtime id and the project path. |
 
 Locks are non-blocking `flock` locks on empty files. Liveness checks acquire and release the lock
-they test. Lock files are never deleted: removing a file that another process has open or locked
+they test, so a process taking ownership of a link lock (the binder's bind lock or the consumer's
+run lock) retries three times, 50 ms apart, before it reports the link as busy. Lock files are never deleted: removing a file that another process has open or locked
 would let two processes hold "the same" lock on different files. `NAME.json` is written to a
 temporary file with mode 600 and renamed into place, and the binder removes it when the binding
 ends normally. A file left behind by a killed binder is ignored, because its bind lock is free.
@@ -53,11 +54,13 @@ ends normally. A file left behind by a killed binder is ignored, because its bin
 The binder refuses to run without `ORCA_PANE_KEY` or inside Herdr (`HERDR_ENV=1`). It then:
 
 1. takes `NAME.bind.lock` and checks that no consumer holds `NAME.run.lock`;
-2. requires an existing `ORCA_AGENT_HOOK_ENDPOINT` file and an `ORCA_TERMINAL_HANDLE`;
-3. asks Orca for the terminal with `<cli> terminal show --terminal <handle> --json` and records
+2. removes a `NAME.json` left by a killed binder, so that consumers report the link as starting
+   instead of using stale values;
+3. requires an existing `ORCA_AGENT_HOOK_ENDPOINT` file and an `ORCA_TERMINAL_HANDLE`;
+4. asks Orca for the terminal with `<cli> terminal show --terminal <handle> --json` and records
    `_meta.runtimeId`, which changes whenever Orca restarts;
-4. takes the target lock and writes `NAME.json`;
-5. for `open`, runs the Herdr client in the foreground (see [Herdr](#herdr)). When the client exits, the binder waits
+5. takes the target lock and writes `NAME.json`;
+6. for `open`, runs the Herdr client in the foreground (see [Herdr](#herdr)). When the client exits, the binder waits
    until no consumer holds `NAME.run.lock`, then ends the binding. For `bind`, it waits for Ctrl-C.
 
 Without a name, `open` reuses one of this project's live links. Otherwise it names the new link
@@ -83,8 +86,11 @@ directory outside Git). No match and several matches are both errors. It then:
 4. checks with the Orca CLI, run in that environment so that it reaches the Orca instance that
    issued the terminal handle, that the terminal still exists with the recorded runtime id;
 5. starts the command directly, without a shell, and polls once per second. If the binding ends
-   while the command runs, the command keeps running and the consumer only reports that hook
-   updates may stop.
+   while the command runs, the command keeps running and the consumer reports once that hook
+   updates may stop. Ctrl-C does not end the consumer before the command: it keeps waiting, so
+   `NAME.run.lock` stays held until the command exits. The consumer then exits with the command's
+   status, 128 + N for signal N, 127 if the command was not found and 126 if it could not be
+   run.
 
 `check` resolves a missing name the same way and performs steps 2 to 4.
 

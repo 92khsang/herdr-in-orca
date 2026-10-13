@@ -5,6 +5,7 @@ orca-link in a Herdr pane run with that context. No settings are changed and no
 daemon runs.
 """
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -26,6 +27,9 @@ KEYS = ('ORCA_PANE_KEY', 'ORCA_AGENT_PANE', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID',
 # ORCA_* variables that locate the Orca installation rather than one terminal. They
 # are the only ORCA_* values passed on from the caller to Herdr and linked commands.
 INSTALL_KEYS = ('ORCA_USER_DATA_PATH', 'ORCA_CLI_COMMAND', 'ORCA_CLI_BIN_DIR', 'ORCA_WSL_CLI_DIR')
+# Liveness checks briefly take the lock they test, so a process that takes
+# ownership of a link lock retries this many times, 50 ms apart.
+LOCK_RETRIES = 3
 
 def clean_environ():
     """Return a copy of this process's environment without terminal-specific ORCA_* values."""
@@ -84,14 +88,33 @@ def cli(env=None):
     return result
 
 def rpc(*args, env=None):
-    p = subprocess.run([cli(env), *args, '--json'], capture_output=True, text=True, timeout=10, env=env)
+    """Run an Orca CLI command with ``--json`` and return its successful reply.
+
+    Raises:
+        RuntimeError: If the CLI is missing, does not answer with a JSON object,
+            or reports an error.
+    """
+    p = subprocess.run([cli(env), *args, '--json'], capture_output=True, timeout=10, env=env)
     try:
-        d = json.loads(p.stdout)
+        reply = json.loads(p.stdout)
     except ValueError:
-        raise RuntimeError('Orca CLI did not return JSON') from None
-    if p.returncode or not d.get('ok'):
-        raise RuntimeError('Orca terminal unavailable; bind again in a new Orca terminal')
-    return d
+        reply = None
+    if not isinstance(reply, dict):
+        raise RuntimeError('Orca CLI did not return JSON')
+    if p.returncode or not reply.get('ok'):
+        error = reply.get('error')
+        code = error.get('code') if isinstance(error, dict) else None
+        if code == 'terminal_handle_stale':
+            raise RuntimeError('The Orca terminal of this link is gone; run orca-link open in a new Orca terminal')
+        if code == 'runtime_unavailable':
+            raise RuntimeError('Orca is not running or cannot be reached')
+        raise RuntimeError('Orca CLI failed' + (' (' + code + ')' if isinstance(code, str) else ''))
+    return reply
+
+def runtime_id(reply):
+    """Return the Orca runtime id from a CLI reply, or None."""
+    meta = reply.get('_meta')
+    return meta.get('runtimeId') if isinstance(meta, dict) else None
 
 def directory():
     p = Path(os.environ.get('XDG_RUNTIME_DIR') or (Path.home() / '.cache')) / 'orca-link'
@@ -100,20 +123,68 @@ def directory():
         raise RuntimeError('orca-link state directory must be private (mode 700) and owned by you')
     return p
 
-def locked(path):
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    f = os.fdopen(fd, 'w')
+class LinkBusy(RuntimeError):
+    """Another process holds the lock."""
+
+def _try_lock(fd):
+    """Take an exclusive lock on ``fd`` without waiting; return False if it is held elsewhere."""
     try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        f.close()
-        raise RuntimeError('This link is already in use') from None
-    return f
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            return False
+        raise
+    return True
+
+def _unlock(fd):
+    """Release a lock taken by _try_lock; closing ``fd`` releases a flock lock anyway."""
+
+class Lock:
+    """An exclusive lock on an empty lock file, held until close().
+
+    Usable as a context manager. Lock files are never written or deleted.
+    """
+
+    def __init__(self, path, retries=0, delay=0.05):
+        self.fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            for attempt in range(retries + 1):
+                if _try_lock(self.fd):
+                    return
+                if attempt < retries:
+                    time.sleep(delay)
+            raise LinkBusy('This link is already in use')
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            try:
+                _unlock(fd)
+            finally:
+                os.close(fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+def locked(path, retries=0):
+    """Return a held Lock on ``path``.
+
+    Raises:
+        LinkBusy: If another process still holds the lock after ``retries`` retries.
+    """
+    return Lock(path, retries)
 
 def is_bound(root, name):
     try:
         f = locked(root / (name + '.bind.lock'))
-    except RuntimeError:
+    except LinkBusy:
         return True
     f.close()
     return False
@@ -132,8 +203,8 @@ def bind(root, name, open_herdr=False):
     # A live consumer may outlast its binding. Reattach Herdr without
     # replacing its immutable child environment or starting another command.
     try:
-        binding = locked(root / (name + '.bind.lock'))
-    except RuntimeError:
+        binding = locked(root / (name + '.bind.lock'), retries=LOCK_RETRIES)
+    except LinkBusy:
         if not open_herdr:
             raise
         attach_existing(name)
@@ -141,7 +212,7 @@ def bind(root, name, open_herdr=False):
     with binding:
         try:
             idle = locked(root / (name + '.run.lock'))
-        except RuntimeError:
+        except LinkBusy:
             if not open_herdr:
                 raise
             binding.close()
@@ -151,7 +222,10 @@ def bind(root, name, open_herdr=False):
         return bind_new(root, name, open_herdr)
 
 def bind_new(root, name, open_herdr):
-    # Caller owns the binding lock until this function returns.
+    # Caller owns the binding lock until this function returns. Remove a file
+    # left by a killed binder, so consumers report "starting" instead of using it.
+    path = root / (name + '.json')
+    path.unlink(missing_ok=True)
     endpoint = os.environ.get('ORCA_AGENT_HOOK_ENDPOINT')
     if not endpoint or not Path(endpoint).is_file():
         raise RuntimeError("Orca hook endpoint file is missing; enable Orca's agent hooks first")
@@ -162,11 +236,14 @@ def bind_new(root, name, open_herdr):
     receipt = rpc('terminal', 'show', '--terminal', env['ORCA_TERMINAL_HANDLE'], env={**clean_environ(), **env})
     # One Orca terminal backs at most one link.
     target = hashlib.sha256(env['ORCA_PANE_KEY'].encode()).hexdigest()
-    with locked(root / (target + '.target.lock')):
-        path = root / (name + '.json')
+    try:
+        target_lock = locked(root / (target + '.target.lock'))
+    except LinkBusy:
+        raise RuntimeError('This Orca terminal already backs another link') from None
+    with target_lock:
         tmp = root / (name + '.tmp')
         with os.fdopen(os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600), 'w') as f:
-            json.dump({'env': env, 'runtime': receipt.get('_meta', {}).get('runtimeId'), 'project': str(project_root())}, f)
+            json.dump({'env': env, 'runtime': runtime_id(receipt), 'project': str(project_root())}, f)
         os.replace(tmp, path)
         print(f'Ready: {name}. In a Herdr pane in this project, run orca-link COMMAND [ARGS...].', flush=True)
         print('Keep this terminal open for hook updates. Ctrl-C closes the binding without stopping the linked command.', flush=True)
@@ -178,7 +255,7 @@ def bind_new(root, name, open_herdr):
                 if open_herdr:
                     try:
                         idle = locked(root / (name + '.run.lock'))
-                    except RuntimeError:
+                    except LinkBusy:
                         pass
                     else:
                         idle.close()
@@ -187,23 +264,47 @@ def bind_new(root, name, open_herdr):
         except KeyboardInterrupt:
             print('\nBinding closed. Linked commands are retained; their Orca hook updates may stop.', flush=True)
         finally:
-            path.unlink(missing_ok=True)
+            # A leftover file is harmless: links whose bind lock is free are ignored.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+def load_binding(root, name):
+    """Return the binding file of link ``name`` after checking its privacy and shape.
+
+    Raises:
+        RuntimeError: If the file is missing, not private, or not a valid binding.
+    """
+    path = root / (name + '.json')
+    invalid = 'Link file of ' + name + ' is invalid; run orca-link open again'
+    try:
+        if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+            raise RuntimeError('Link file is not private')
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise RuntimeError('Link ' + name + ' is starting or closing; try again in a moment') from None
+    except ValueError:
+        raise RuntimeError(invalid) from None
+    env = data.get('env') if isinstance(data, dict) else None
+    if (not isinstance(env, dict) or not env.get('ORCA_TERMINAL_HANDLE')
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+            or not isinstance(data.get('project', ''), str)):
+        raise RuntimeError(invalid)
+    return data
 
 def context(root, name):
     if not is_bound(root, name):
-        raise RuntimeError('Link is not bound; run orca-link bind ' + name + ' in Orca')
-    path = root / (name + '.json')
-    if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
-        raise RuntimeError('Link file is not private')
-    data = json.loads(path.read_text())
+        raise RuntimeError('Link ' + name + ' is not live; run orca-link open in an Orca terminal')
+    data = load_binding(root, name)
     # Pass the caller's environment through (Herdr variables, credentials); the
     # terminal's ORCA_* values come from the link. The Orca CLI runs with the same
     # environment, so it reaches the Orca instance that issued the terminal handle.
     env = clean_environ()
     env.update({k: v for k, v in data['env'].items() if k in KEYS})
     receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'], env=env)
-    if data.get('runtime') != receipt.get('_meta', {}).get('runtimeId'):
-        raise RuntimeError('Orca restarted; bind again')
+    if data.get('runtime') != runtime_id(receipt):
+        raise RuntimeError('Orca restarted since link ' + name + ' was bound; run orca-link open in a new Orca terminal')
     warn_inherited_identity(env.get('ORCA_PANE_KEY'))
     # Codex's installed hook guard requires a hook root before loading endpoint.env.
     native_root = Path.home() / '.orca'
@@ -224,25 +325,44 @@ def warn_inherited_identity(linked_pane_key):
               'so commands started here without orca-link report to that terminal. Stop the Herdr '
               'server and start it again with `orca-link open` to fix this.', file=sys.stderr)
 
+def exit_status(returncode):
+    """Return the exit status that reports a child's ``Popen.returncode``."""
+    if os.name == 'nt':
+        # Python 3.11 and 3.12 truncate exit statuses above 2**31 - 1 on Windows.
+        return returncode - (1 << 32) if returncode >= 1 << 31 else returncode
+    # A child killed by signal N has return code -N; shells report 128 + N.
+    return 128 - returncode if returncode < 0 else returncode
+
 def run(root, name, command):
+    """Run ``command`` with link ``name``'s context and return its exit status."""
     if not command:
         raise RuntimeError('Supply a command, e.g. claude or codex')
-    with locked(root / (name + '.run.lock')):
+    with locked(root / (name + '.run.lock'), retries=LOCK_RETRIES):
         env = context(root, name)
-        p = subprocess.Popen(command, env=env)
         try:
-            while p.poll() is None:
-                if not is_bound(root, name):
-                    print('orca-link: binding closed; the linked command keeps running, but its Orca updates may stop.', file=sys.stderr)
-                    return p.wait()
-                try:
-                    p.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-            return p.returncode
-        except KeyboardInterrupt:
-            # The foreground process receives the same terminal Ctrl-C.
-            return p.wait()
+            p = subprocess.Popen(command, env=env)
+        except FileNotFoundError:
+            print('orca-link: command not found: ' + command[0], file=sys.stderr)
+            return 127
+        except PermissionError:
+            print('orca-link: permission denied: ' + command[0], file=sys.stderr)
+            return 126
+        warned = False
+        while True:
+            try:
+                while p.poll() is None:
+                    if not warned and not is_bound(root, name):
+                        warned = True
+                        print('orca-link: binding closed; the linked command keeps running, but its Orca updates may stop.', file=sys.stderr)
+                    try:
+                        p.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                return exit_status(p.returncode)
+            except KeyboardInterrupt:
+                # The command received the same Ctrl-C. Keep waiting, so the link
+                # stays busy until the command exits.
+                continue
 
 def _main(argv):
     parser = argparse.ArgumentParser(
