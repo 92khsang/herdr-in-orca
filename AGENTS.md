@@ -1,6 +1,7 @@
 ## Rules
 
 - Use only the Python standard library at runtime; never add runtime dependencies.
+- Keep one code path for Linux, macOS and native Windows: POSIX-only calls stay behind `_try_lock`, `_unlock` and `private()`, and processes start from `resolve_executable()` (on Linux and macOS a linked command keeps the name it was given).
 - Never read, copy or store agent credentials or configs, or Orca's hook port and token; orca-link passes environment variables only.
 - Keep the state directory and its files private to the user; do not weaken the ownership, mode or symlink checks.
 - A linked command keeps the environment it started with: never signal, kill or re-target it when its binding closes or is reopened.
@@ -13,7 +14,7 @@
 
 ## Commands
 
-Run from the repository root:
+Run from the repository root (on Windows, `py` instead of `python3`):
 
 ```sh
 python3 -m unittest tests.test_orca_link.WrapperTests.test_named_binding   # one test

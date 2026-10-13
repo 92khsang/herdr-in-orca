@@ -1,0 +1,3 @@
+# Keep LF line endings in every checkout, including Windows, so that files edited
+# there do not show up as whole-file changes.
+* text=auto eol=lf

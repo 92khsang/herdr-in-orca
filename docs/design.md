@@ -31,7 +31,8 @@ goes stale when its terminal closes or Orca restarts.
 ## State directory
 
 The state directory is `$XDG_RUNTIME_DIR/orca-link`, or `~/.cache/orca-link` when `XDG_RUNTIME_DIR`
-is unset or empty. It must be a real
+is unset or empty; on Windows it is `%LOCALAPPDATA%\orca-link` (see [Platforms](#platforms)). It
+must be a real
 directory owned by the user with no group or other permission bits. For a link named `NAME` it
 holds:
 
@@ -116,9 +117,26 @@ running keeps the environment it was started with. When a consumer runs in a pan
 environment, usually by running `herdr` directly in an Orca terminal, and the consumer prints a
 note saying so.
 
+## Platforms
+
+One code path serves Linux, macOS and native Windows; the differences live in a few helpers.
+
+| Concern | Linux and macOS | Windows |
+|---|---|---|
+| Locks (`_try_lock`, `_unlock`) | `flock` with `LOCK_EX \| LOCK_NB`; closing the file releases it | `msvcrt.locking(LK_NBLCK)` on byte 0, unlocked explicitly before closing, because Windows releases a closed handle's locks only eventually |
+| Private state (`private()`) | owner and mode checks; files opened with `O_NOFOLLOW` | Windows reports no owner and synthetic modes, so the check relies on `%LOCALAPPDATA%` being per user; `mkdir(mode=0o700)` also applies an owner-only ACL on Pythons that include the fix for CVE-2024-4030 |
+| Programs (`resolve_executable()`) | `shutil.which`; a linked command keeps the name it was given | PATH directories only, never the current directory, and only `.com`, `.exe`, `.bat` and `.cmd` |
+| Batch files | not applicable | arguments containing cmd.exe metacharacters are refused, because cmd.exe re-parses a batch file's command line |
+| Ctrl-C while a command runs | `SIGINT` is ignored with a handler | `SIGINT` and `SIGBREAK` are ignored with a handler |
+| Exit status | 128 + N for signal N | the 32-bit code is passed on as a signed value, because Python 3.11 and 3.12 truncate larger values |
+
+The binder records the absolute path of the Orca CLI in `NAME.json` (`cli`), because Herdr panes on
+Windows take `PATH` from the registry and may not see the directory the Orca terminal had on `PATH`.
+Consumers use the recorded path while it exists and look the CLI up again otherwise.
+
 ## Orca command-line tool
 
 orca-link calls `orca-ide` on Linux, where `orca` is usually the GNOME screen reader, and `orca`
-elsewhere. `ORCA_CLI_COMMAND` overrides the name or path; each orca-link process reads it from its
-own environment, so binders read it in the Orca terminal and consumers in the Herdr pane. Orca sets
-it itself in WSL terminals.
+elsewhere (`orca.exe` or `orca.cmd` on Windows). `ORCA_CLI_COMMAND` overrides the name or path. The
+binder reads it in the Orca terminal and records the resolved path; a consumer reads it from its
+own environment only when the recorded path no longer exists. Orca sets it itself in WSL terminals.

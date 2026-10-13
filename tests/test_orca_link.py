@@ -206,7 +206,7 @@ class IdentityTests(unittest.TestCase):
         self.bind_link('it', Path('/a/app'), bound)
         rpc_envs = []
 
-        def rpc(*args, env=None):
+        def rpc(*args, env=None, program=None):
             rpc_envs.append(dict(env))
             return {'_meta': {'runtimeId': 'rt'}}
         err = io.StringIO()
@@ -244,7 +244,7 @@ class IdentityTests(unittest.TestCase):
     def test_context_names_the_link_when_its_terminal_is_gone(self):
         self.bind_link('it', Path('/a/app'), {'ORCA_PANE_KEY': 'bound', 'ORCA_TERMINAL_HANDLE': 'term'})
 
-        def rpc(*args, env=None):
+        def rpc(*args, env=None, program=None):
             raise M['TerminalGone']('gone')
         with patch.dict(os.environ, {}, clear=True), patch.dict(M, {'rpc': rpc}):
             with self.assertRaisesRegex(RuntimeError, 'terminal of link it is gone; run orca-link open it '):
@@ -254,14 +254,14 @@ class IdentityTests(unittest.TestCase):
         env = {'ORCA_CLI_COMMAND': 'orca-test', 'PATH': 'test-path'}
         seen = {}
 
-        def which(name, path=None):
+        def resolve(name, path=None):
             seen['which'] = (name, path)
             return 'resolved-orca'
 
         def run(argv, **kwargs):
             seen['run'] = (argv, kwargs.get('env'))
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "_meta": {"runtimeId": "rt"}}', stderr='')
-        with patch.object(M['shutil'], 'which', which), patch.object(M['subprocess'], 'run', run):
+        with patch.dict(M, {'resolve_executable': resolve}), patch.object(M['subprocess'], 'run', run):
             M['rpc']('terminal', 'show', '--terminal', 'h', env=env)
         self.assertEqual(seen['which'], ('orca-test', 'test-path'))
         self.assertEqual(seen['run'], (['resolved-orca', 'terminal', 'show', '--terminal', 'h', '--json'], env))
@@ -343,7 +343,8 @@ class HardeningTests(unittest.TestCase):
         return Child()
 
     def run_with(self, child, is_bound=lambda root, name: True, popen=None):
-        with patch.dict(M, {'context': lambda root, name: {}, 'is_bound': is_bound}), \
+        with patch.dict(M, {'context': lambda root, name: {}, 'is_bound': is_bound,
+                            'resolve_executable': lambda name, path=None: name}), \
              patch.object(M['subprocess'], 'Popen', popen or (lambda *args, **kwargs: child)):
             return M['run'](self.root, 'test', ['tool'])
 
@@ -453,10 +454,10 @@ class HardeningTests(unittest.TestCase):
         (self.root / 'it.json').write_text('{"stale": true}')
         seen = []
 
-        def rpc(*args, env=None):
+        def rpc(*args, env=None, program=None):
             seen.append((self.root / 'it.json').exists())
             raise RuntimeError('stop')
-        with patch.dict(os.environ, self.binder_env(), clear=True), patch.dict(M, {'rpc': rpc}):
+        with patch.dict(os.environ, self.binder_env(), clear=True), patch.dict(M, {'rpc': rpc, 'cli': lambda env=None: 'orca-test'}):
             with self.assertRaisesRegex(RuntimeError, 'stop'):
                 M['bind'](self.root, 'it')
         self.assertEqual(seen, [False])
@@ -465,7 +466,8 @@ class HardeningTests(unittest.TestCase):
         held = M['locked'](self.root / (hashlib.sha256(b'pane').hexdigest() + '.target.lock'))
         self.addCleanup(held.close)
         with patch.dict(os.environ, self.binder_env(), clear=True), \
-             patch.dict(M, {'rpc': lambda *args, env=None: {'_meta': {'runtimeId': 'rt'}}, 'project_root': lambda: self.root}):
+             patch.dict(M, {'rpc': lambda *args, env=None, program=None: {'_meta': {'runtimeId': 'rt'}},
+                            'cli': lambda env=None: 'orca-test', 'project_root': lambda: self.root}):
             with self.assertRaisesRegex(RuntimeError, 'already backs another link'):
                 M['bind'](self.root, 'it')
         self.assertFalse((self.root / 'it.json').exists())
@@ -478,6 +480,90 @@ class HardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'not private'):
                 M['load_binding'](self.root, 'it')
 
+class PlatformTests(unittest.TestCase):
+    def test_windows_executable_search(self):
+        files = {r'C:\tools\codex', r'C:\tools\codex.cmd', r'C:\bin\git.exe', r'C:\work\git.exe',
+                 r'C:\tools\script.js'}
+
+        def find(name):
+            return M['windows_executable'](name, r'C:\tools;C:\bin;.;relative', '.COM;.EXE;.BAT;.CMD;.JS',
+                                           isfile=files.__contains__)
+        # npm's extensionless shell shim is skipped in favor of its .cmd file.
+        self.assertEqual(find('codex'), r'C:\tools\codex.cmd')
+        # Only PATH is searched: neither "." nor a relative entry is used.
+        self.assertEqual(find('git'), r'C:\bin\git.exe')
+        self.assertIsNone(find('script'))
+        self.assertEqual(find(r'C:\bin\git'), r'C:\bin\git.exe')
+        self.assertIsNone(find('missing'))
+
+    def test_unsafe_batch_arguments(self):
+        unsafe = M['unsafe_batch_argument']
+        self.assertIsNone(unsafe(r'C:\tools\codex.exe', ['fix A & B']))
+        self.assertIsNone(unsafe(r'C:\tools\codex.cmd', ['resume', '--last', 'a b']))
+        for arg in ('fix A & B', '50%', 'say "hi"', 'a|b', 'x^y', 'line\nbreak', '(group)', 'wow!'):
+            with self.subTest(arg=arg):
+                self.assertEqual(unsafe(r'C:\tools\codex.CMD', ['run', arg]), arg)
+
+    def windows_wait(self, program, args):
+        """Run wait_for() as on Windows with ``program`` as the resolved command."""
+        started = []
+
+        class Child:
+            returncode = 0
+
+            def poll(self):
+                return 0
+        err = io.StringIO()
+        root = Path('state')  # created before os.name is patched: pathlib reads os.name
+        with patch.object(M['os'], 'name', 'nt'), \
+             patch.dict(M, {'resolve_executable': lambda name, path=None: program, 'is_bound': lambda root, name: True}), \
+             patch.object(M['subprocess'], 'Popen', lambda command, env: started.append(command) or Child()), \
+             contextlib.redirect_stderr(err):
+            status = M['wait_for'](root, 'test', ['codex', *args], {})
+        return status, started, err.getvalue()
+
+    def test_windows_commands_start_from_their_resolved_path(self):
+        status, started, _ = self.windows_wait(r'C:\tools\codex.cmd', ['resume', '--last'])
+        self.assertEqual((status, started), (0, [[r'C:\tools\codex.cmd', 'resume', '--last']]))
+
+    def test_windows_refuses_unsafe_batch_arguments(self):
+        status, started, err = self.windows_wait(r'C:\tools\codex.cmd', ['fix A & B'])
+        self.assertEqual((status, started), (126, []))
+        self.assertIn('batch file', err)
+
+    def test_windows_reports_a_missing_command(self):
+        status, started, err = self.windows_wait(None, [])
+        self.assertEqual((status, started), (127, []))
+        self.assertIn('command not found: codex', err)
+
+    def test_context_prefers_the_cli_recorded_at_bind_time(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        recorded = root / 'orca-cli'
+        recorded.touch()
+        lock = M['locked'](root / 'it.bind.lock')
+        self.addCleanup(lock.close)
+        programs = []
+        for cli in (str(recorded), str(root / 'removed-cli')):
+            (root / 'it.json').write_text(json.dumps({'env': {'ORCA_TERMINAL_HANDLE': 'term'}, 'runtime': 'rt', 'cli': cli}))
+            (root / 'it.json').chmod(0o600)
+
+            def rpc(*args, env=None, program=None):
+                programs.append(program)
+                return {'_meta': {'runtimeId': 'rt'}}
+            with patch.dict(os.environ, {}, clear=True), patch.dict(M, {'rpc': rpc}):
+                M['context'](root, 'it')
+        self.assertEqual(programs, [str(recorded), None])
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt is Windows-only')
+    def test_windows_lock_failures_other_than_contention_are_errors(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(M['msvcrt'], 'locking', side_effect=OSError(errno.EBADF, 'Bad file descriptor')):
+            with self.assertRaises(OSError):
+                M['locked'](Path(temp.name) / 'x.lock')
+
 class BindingExitTests(unittest.TestCase):
     def test_reopen_existing_binding_or_orphan_consumer(self):
         for suffix in ('bind', 'run'):
@@ -488,7 +574,8 @@ class BindingExitTests(unittest.TestCase):
                      patch.dict(os.environ, {'ORCA_PANE_KEY': 'pane', 'ORCA_AGENT_PANE': 'pane',
                                              'ORCA_CLI_COMMAND': 'orca-test', 'OTHER': 'kept'}, clear=True), \
                      patch.object(M['subprocess'], 'run') as attach, \
-                     patch.dict(M, {'bind_new': lambda *a: self.fail('Must not replace context')}), \
+                     patch.dict(M, {'bind_new': lambda *a: self.fail('Must not replace context'),
+                                    'herdr_program': lambda: 'herdr'}), \
                      contextlib.redirect_stdout(io.StringIO()):
                     M['bind'](root, 'test', open_herdr=True)
                     assert_herdr_started(self, attach, {'ORCA_CLI_COMMAND': 'orca-test', 'OTHER': 'kept'})
@@ -506,6 +593,7 @@ class BindingExitTests(unittest.TestCase):
             with M['locked'](root / 'test.bind.lock'), \
                  patch.dict(os.environ, {'ORCA_PANE_KEY': 'pane'}, clear=True), \
                  patch.object(M['subprocess'], 'run', side_effect=KeyboardInterrupt), \
+                 patch.dict(M, {'herdr_program': lambda: 'herdr'}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 M['bind'](root, 'test', open_herdr=True)
                 self.assertTrue(M['is_bound'](root, 'test'))
@@ -524,10 +612,11 @@ class BindingExitTests(unittest.TestCase):
             }, clear=True))
             rpc_envs = []
 
-            def rpc(*args, env=None):
+            def rpc(*args, env=None, program=None):
                 rpc_envs.append(dict(env))
                 return {'_meta': {'runtimeId': 'test'}}
-            stack.enter_context(patch.dict(M, {'rpc': rpc, 'project_root': lambda: root}))
+            stack.enter_context(patch.dict(M, {'rpc': rpc, 'project_root': lambda: root,
+                                               'cli': lambda env=None: 'orca-test', 'herdr_program': lambda: 'herdr'}))
             # What a binder captures: the KEYS it has, never the hook token.
             captured = {'ORCA_PANE_KEY': 'test-pane', 'ORCA_AGENT_PANE': 'test-pane', 'ORCA_TERMINAL_HANDLE': 'test-terminal',
                         'ORCA_AGENT_HOOK_ENDPOINT': str(endpoint), 'ORCA_USER_DATA_PATH': 'data'}
@@ -565,7 +654,7 @@ class BindingExitTests(unittest.TestCase):
             self.assertEqual(rpc_envs, [{**clean, **captured}])
             if open_herdr:
                 assert_herdr_started(self, run_mock, clean)
-                self.assertEqual(bindings, [{'env': captured, 'runtime': 'test', 'project': str(root)}])
+                self.assertEqual(bindings, [{'env': captured, 'runtime': 'test', 'project': str(root), 'cli': 'orca-test'}])
             else:
                 run_mock.assert_not_called()
             if open_herdr and (not active or interrupt_herdr):
