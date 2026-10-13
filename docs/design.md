@@ -53,9 +53,10 @@ ends normally. A file left behind by a killed binder is ignored, because its bin
 
 The binder refuses to run without `ORCA_PANE_KEY` or inside Herdr (`HERDR_ENV=1`). It then:
 
-1. takes `NAME.bind.lock` and checks that no consumer holds `NAME.run.lock`;
-2. removes a `NAME.json` left by a killed binder, so that consumers report the link as starting
-   instead of using stale values;
+1. takes `NAME.bind.lock` and removes any `NAME.json`: a free bind lock means no binder is alive,
+   so the file was left by a killed binder, and consumers must report the link as starting
+   instead of using it;
+2. checks that no consumer holds `NAME.run.lock`;
 3. requires an existing `ORCA_AGENT_HOOK_ENDPOINT` file and an `ORCA_TERMINAL_HANDLE`;
 4. asks Orca for the terminal with `<cli> terminal show --terminal <handle> --json` and records
    `_meta.runtimeId`, which changes whenever Orca restarts;
@@ -87,10 +88,11 @@ directory outside Git). No match and several matches are both errors. It then:
    issued the terminal handle, that the terminal still exists with the recorded runtime id;
 5. starts the command directly, without a shell, and polls once per second. If the binding ends
    while the command runs, the command keeps running and the consumer reports once that hook
-   updates may stop. Ctrl-C does not end the consumer before the command: it keeps waiting, so
-   `NAME.run.lock` stays held until the command exits. The consumer then exits with the command's
-   status, 128 + N for signal N, 127 if the command was not found and 126 if it could not be
-   run.
+   updates may stop. While the command runs, the consumer handles Ctrl-C with a handler that does
+   nothing, so `NAME.run.lock` stays held until the command exits; the command itself gets the
+   default handling, because exec resets caught signals. The consumer then exits with the
+   command's status, 128 + N for signal N, 127 if the command was not found and 126 if it could
+   not be started.
 
 `check` resolves a missing name the same way and performs steps 2 to 4.
 

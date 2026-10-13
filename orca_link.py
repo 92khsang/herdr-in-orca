@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -87,6 +88,12 @@ def cli(env=None):
         raise RuntimeError('Orca CLI not found: ' + value)
     return result
 
+class TerminalGone(RuntimeError):
+    """Orca no longer knows the terminal."""
+
+# Orca CLI error codes that mean the terminal handle no longer names a live terminal.
+GONE_CODES = ('terminal_handle_stale', 'terminal_gone', 'terminal_exited', 'terminal_not_found')
+
 def rpc(*args, env=None):
     """Run an Orca CLI command with ``--json`` and return its successful reply.
 
@@ -104,8 +111,8 @@ def rpc(*args, env=None):
     if p.returncode or not reply.get('ok'):
         error = reply.get('error')
         code = error.get('code') if isinstance(error, dict) else None
-        if code == 'terminal_handle_stale':
-            raise RuntimeError('The Orca terminal of this link is gone; run orca-link open in a new Orca terminal')
+        if code in GONE_CODES:
+            raise TerminalGone('The Orca terminal is gone')
         if code == 'runtime_unavailable':
             raise RuntimeError('Orca is not running or cannot be reached')
         raise RuntimeError('Orca CLI failed' + (' (' + code + ')' if isinstance(code, str) else ''))
@@ -159,6 +166,8 @@ class Lock:
             self.fd = None
             raise
 
+    fd = None
+
     def close(self):
         if self.fd is not None:
             fd, self.fd = self.fd, None
@@ -171,6 +180,9 @@ class Lock:
         return self
 
     def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
         self.close()
 
 def locked(path, retries=0):
@@ -210,6 +222,9 @@ def bind(root, name, open_herdr=False):
         attach_existing(name)
         return
     with binding:
+        # Holding the bind lock proves that no binder is alive, so a binding file
+        # left by a killed binder is stale; remove it before anyone reads it.
+        (root / (name + '.json')).unlink(missing_ok=True)
         try:
             idle = locked(root / (name + '.run.lock'))
         except LinkBusy:
@@ -222,10 +237,8 @@ def bind(root, name, open_herdr=False):
         return bind_new(root, name, open_herdr)
 
 def bind_new(root, name, open_herdr):
-    # Caller owns the binding lock until this function returns. Remove a file
-    # left by a killed binder, so consumers report "starting" instead of using it.
+    # Caller owns the binding lock until this function returns.
     path = root / (name + '.json')
-    path.unlink(missing_ok=True)
     endpoint = os.environ.get('ORCA_AGENT_HOOK_ENDPOINT')
     if not endpoint or not Path(endpoint).is_file():
         raise RuntimeError("Orca hook endpoint file is missing; enable Orca's agent hooks first")
@@ -277,7 +290,7 @@ def load_binding(root, name):
         RuntimeError: If the file is missing, not private, or not a valid binding.
     """
     path = root / (name + '.json')
-    invalid = 'Link file of ' + name + ' is invalid; run orca-link open again'
+    invalid = 'Link file of ' + name + ' is invalid; run orca-link open ' + name + ' again'
     try:
         if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
             raise RuntimeError('Link file is not private')
@@ -295,16 +308,20 @@ def load_binding(root, name):
 
 def context(root, name):
     if not is_bound(root, name):
-        raise RuntimeError('Link ' + name + ' is not live; run orca-link open in an Orca terminal')
+        raise RuntimeError('Link ' + name + ' is not live; run orca-link open ' + name + ' in an Orca terminal')
     data = load_binding(root, name)
     # Pass the caller's environment through (Herdr variables, credentials); the
     # terminal's ORCA_* values come from the link. The Orca CLI runs with the same
     # environment, so it reaches the Orca instance that issued the terminal handle.
     env = clean_environ()
     env.update({k: v for k, v in data['env'].items() if k in KEYS})
-    receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'], env=env)
+    rebind = 'run orca-link open ' + name + ' in a new Orca terminal'
+    try:
+        receipt = rpc('terminal', 'show', '--terminal', data['env']['ORCA_TERMINAL_HANDLE'], env=env)
+    except TerminalGone:
+        raise RuntimeError('The Orca terminal of link ' + name + ' is gone; ' + rebind) from None
     if data.get('runtime') != runtime_id(receipt):
-        raise RuntimeError('Orca restarted since link ' + name + ' was bound; run orca-link open in a new Orca terminal')
+        raise RuntimeError('Orca restarted since link ' + name + ' was bound; ' + rebind)
     warn_inherited_identity(env.get('ORCA_PANE_KEY'))
     # Codex's installed hook guard requires a hook root before loading endpoint.env.
     native_root = Path.home() / '.orca'
@@ -339,30 +356,39 @@ def run(root, name, command):
         raise RuntimeError('Supply a command, e.g. claude or codex')
     with locked(root / (name + '.run.lock'), retries=LOCK_RETRIES):
         env = context(root, name)
+        # The command receives Ctrl-C itself. orca-link ignores it until the command
+        # exits, so the link stays busy for as long as the command runs. A Python
+        # handler (unlike SIG_IGN) is reset to the default in the started command.
+        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
         try:
-            p = subprocess.Popen(command, env=env)
-        except FileNotFoundError:
-            print('orca-link: command not found: ' + command[0], file=sys.stderr)
-            return 127
-        except PermissionError:
-            print('orca-link: permission denied: ' + command[0], file=sys.stderr)
-            return 126
-        warned = False
-        while True:
+            return wait_for(root, name, command, env)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+def wait_for(root, name, command, env):
+    try:
+        p = subprocess.Popen(command, env=env)
+    except FileNotFoundError:
+        print('orca-link: command not found: ' + command[0], file=sys.stderr)
+        return 127
+    except OSError as e:
+        print('orca-link: cannot run ' + command[0] + ': ' + (e.strerror or str(e)), file=sys.stderr)
+        return 126
+    warned = False
+    while p.poll() is None:
+        if not warned:
             try:
-                while p.poll() is None:
-                    if not warned and not is_bound(root, name):
-                        warned = True
-                        print('orca-link: binding closed; the linked command keeps running, but its Orca updates may stop.', file=sys.stderr)
-                    try:
-                        p.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        pass
-                return exit_status(p.returncode)
-            except KeyboardInterrupt:
-                # The command received the same Ctrl-C. Keep waiting, so the link
-                # stays busy until the command exits.
-                continue
+                bound = is_bound(root, name)
+            except OSError:
+                bound = False
+            if not bound:
+                warned = True
+                print('orca-link: binding closed; the linked command keeps running, but its Orca updates may stop.', file=sys.stderr)
+        try:
+            p.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    return exit_status(p.returncode)
 
 def _main(argv):
     parser = argparse.ArgumentParser(
@@ -431,10 +457,12 @@ def main(argv=None):
         argv: Arguments without the program name; defaults to ``sys.argv[1:]``.
 
     Returns:
-        For the run forms, the linked command's ``Popen.returncode`` (``-N`` if
-        signal N killed it). 0 for ``open``, ``bind`` and ``check``, including a
-        binding closed with Ctrl-C. 1 after a reported error. 130 if Ctrl-C
-        interrupts orca-link before a binding or command starts.
+        For the run forms, the command's status from exit_status(): its exit
+        code, 128 + N if signal N ended it on Linux and macOS, 127 if it was not
+        found and 126 if it could not be started. 0 for ``open``, ``bind`` and
+        ``check``, including a binding closed with Ctrl-C. 1 after any other
+        reported error. 130 if Ctrl-C interrupts orca-link before a binding or
+        command starts.
 
     Raises:
         SystemExit: From argparse, with status 0 for ``--help`` and ``--version``

@@ -96,8 +96,8 @@ orca-link my-launcher --some-option
 - Before each command starts, orca-link checks the link's Orca terminal with the Orca CLI. If Orca has
   restarted or the terminal is gone, bind again in a new Orca terminal.
 - `orca-link COMMAND` exits with the command's exit status: 128 + N if signal N ended it, 127 if the
-  command was not found, and 126 if it could not be run. `Ctrl-C` reaches the command, and
-  orca-link keeps waiting until the command exits.
+  command was not found, and 126 if it could not be started. `Ctrl-C` reaches the command, and
+  orca-link ignores it and keeps waiting until the command exits.
 - When you close Herdr after `open`, the binding closes once no linked command is running. After
   that, or with `bind`, `Ctrl-C` in the binding terminal closes the binding at once; while Herdr is
   open there, `Ctrl-C` goes to Herdr. Linked commands keep running after their binding closes, but
