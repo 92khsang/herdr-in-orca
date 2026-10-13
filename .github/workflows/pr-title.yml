@@ -1,0 +1,26 @@
+name: PR title
+
+# Squash merges use the PR title as the commit subject on main, so the title is
+# where the Conventional Commits format is enforced. `edited` re-runs the check
+# when the title changes.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a Conventional Commits header
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: [^[:space:]](.*[^.[:space:]])?$'
+          if [[ ${#TITLE} -gt 100 || ! $TITLE =~ $pattern ]]; then
+            echo "::error::The PR title must be a Conventional Commits header of at most 100 characters, such as 'fix(scope): describe the change'."
+            printf 'Title: %s\n' "$TITLE"
+            exit 1
+          fi
