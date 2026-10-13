@@ -423,10 +423,12 @@ def context(root, name):
     if data.get('runtime') != runtime_id(receipt):
         raise RuntimeError('Orca restarted since link ' + name + ' was bound; ' + rebind)
     warn_inherited_identity(env.get('ORCA_PANE_KEY'))
-    # Codex's installed hook guard requires a hook root before loading endpoint.env.
-    native_root = Path.home() / '.orca'
-    if not env.get('ORCA_AGENT_HOOK_ROOT') and (native_root / 'agent-hooks/codex-hook.sh').is_file():
-        env['ORCA_AGENT_HOOK_ROOT'] = str(native_root)
+    # On Linux and macOS, Codex's installed hook guard requires a hook root before
+    # loading endpoint.env. Orca's Windows hook commands have no such guard.
+    if os.name != 'nt' and not env.get('ORCA_AGENT_HOOK_ROOT'):
+        native_root = Path.home() / '.orca'
+        if (native_root / 'agent-hooks' / 'codex-hook.sh').is_file():
+            env['ORCA_AGENT_HOOK_ROOT'] = str(native_root)
     return env
 
 def warn_inherited_identity(linked_pane_key):

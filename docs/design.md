@@ -104,7 +104,8 @@ runners that drop variables named like secrets), `ORCA_TAB_ID`, `ORCA_WORKTREE_I
 binding terminal does not have are simply absent. Orca's Codex hook command runs its script only when
 `ORCA_AGENT_HOOK_ROOT` or `ORCA_AGENT_HOOK_PORT` is set. orca-link never passes the port, so when
 Orca did not set `ORCA_AGENT_HOOK_ROOT` and `~/.orca/agent-hooks/codex-hook.sh` exists, it sets
-`ORCA_AGENT_HOOK_ROOT` to `~/.orca`.
+`ORCA_AGENT_HOOK_ROOT` to `~/.orca`. On Windows, Orca's Codex hook command has no such guard, so
+orca-link does not set it there.
 
 ## Herdr
 

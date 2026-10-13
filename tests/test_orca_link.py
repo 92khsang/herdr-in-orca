@@ -224,7 +224,9 @@ class IdentityTests(unittest.TestCase):
         env, rpc_env, _ = self.linked_context(caller, bound)
         expected = {'ORCA_CLI_COMMAND': 'orca-test', 'HOME': str(home), 'USERPROFILE': str(home), 'OTHER': 'kept', **bound}
         self.assertEqual(rpc_env, expected)
-        self.assertEqual(env, {**expected, 'ORCA_AGENT_HOOK_ROOT': str(home / '.orca')})
+        # Only Orca's Codex hook command on Linux and macOS needs the hook root.
+        root = {} if os.name == 'nt' else {'ORCA_AGENT_HOOK_ROOT': str(home / '.orca')}
+        self.assertEqual(env, {**expected, **root})
 
     def test_context_notes_an_identity_inherited_from_herdr(self):
         bound = {'ORCA_PANE_KEY': 'bound', 'ORCA_TERMINAL_HANDLE': 'term'}
