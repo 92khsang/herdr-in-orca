@@ -31,18 +31,18 @@ goes stale when its terminal closes or Orca restarts.
 ## State directory
 
 The state directory is `$XDG_RUNTIME_DIR/orca-link`, or `~/.cache/orca-link` when `XDG_RUNTIME_DIR`
-is unset or empty. It must be a real
-directory owned by the user with no group or other permission bits. For a link named `NAME` it
-holds:
+is unset or empty; on Windows it is `%LOCALAPPDATA%\orca-link` (see [Platforms](#platforms)). It
+must be a real directory; on Linux and macOS it must also be owned by the user with no group or
+other permission bits. For a link named `NAME` it holds:
 
 | File | Meaning |
 |---|---|
 | `NAME.bind.lock` | Locked by the binder for the link's lifetime. A link is *live* while this lock is held. |
 | `NAME.run.lock` | Locked by the consumer while its command runs, so a link runs one command at a time. |
 | `<sha256 of ORCA_PANE_KEY>.target.lock` | Locked by the binder so one Orca terminal backs at most one link. |
-| `NAME.json` | Written by the binder: the captured variables, Orca's runtime id and the project path. |
+| `NAME.json` | Written by the binder: the captured variables, Orca's runtime id, the project path and the Orca CLI path (`cli`). |
 
-Locks are non-blocking `flock` locks on empty files. Liveness checks acquire and release the lock
+Locks are non-blocking `flock` locks (`msvcrt.locking` on Windows) on empty files. Liveness checks acquire and release the lock
 they test, so a process taking ownership of a link lock (the binder's bind lock or the consumer's
 run lock) retries three times, 50 ms apart, before it reports the link as busy. Lock files are never deleted: removing a file that another process has open or locked
 would let two processes hold "the same" lock on different files. `NAME.json` is written to a
@@ -103,7 +103,8 @@ runners that drop variables named like secrets), `ORCA_TAB_ID`, `ORCA_WORKTREE_I
 binding terminal does not have are simply absent. Orca's Codex hook command runs its script only when
 `ORCA_AGENT_HOOK_ROOT` or `ORCA_AGENT_HOOK_PORT` is set. orca-link never passes the port, so when
 Orca did not set `ORCA_AGENT_HOOK_ROOT` and `~/.orca/agent-hooks/codex-hook.sh` exists, it sets
-`ORCA_AGENT_HOOK_ROOT` to `~/.orca`.
+`ORCA_AGENT_HOOK_ROOT` to `~/.orca`. On Windows, Orca's Codex hook command has no such guard, so
+orca-link does not set it there.
 
 ## Herdr
 
@@ -116,9 +117,28 @@ running keeps the environment it was started with. When a consumer runs in a pan
 environment, usually by running `herdr` directly in an Orca terminal, and the consumer prints a
 note saying so.
 
+## Platforms
+
+One code path serves Linux, macOS and native Windows; the differences live in a few helpers.
+
+| Concern | Linux and macOS | Windows |
+|---|---|---|
+| Locks (`_try_lock`, `_unlock`) | `flock` with `LOCK_EX \| LOCK_NB`; closing the file releases it | `msvcrt.locking(LK_NBLCK)` on byte 0, unlocked explicitly before closing, because Windows releases a closed handle's locks only eventually |
+| Private state (`private()`) | owner and mode checks; files opened with `O_NOFOLLOW` | Windows reports no owner and synthetic modes, so the check relies on `%LOCALAPPDATA%` being per user; `mkdir(mode=0o700)` also applies an owner-only ACL on Pythons that include the fix for CVE-2024-4030 |
+| Programs (`resolve_executable()`) | `shutil.which`; a linked command keeps the name it was given | PATH directories only, never the current directory, and only `.com`, `.exe`, `.bat` and `.cmd` |
+| Batch files | not applicable | the file's path is always quoted; arguments containing cmd.exe metacharacters or line breaks, and paths containing `%` or `!`, are refused, because cmd.exe parses a batch file's command line again |
+| Ctrl-C while a command runs | `SIGINT` is ignored with a handler | `SIGINT` and `SIGBREAK` are ignored with a handler |
+| Exit status | 128 + N for signal N | the 32-bit code is passed on as a signed value, because Python 3.11 and 3.12 truncate larger values |
+
+The binder records the absolute path of the Orca CLI in `NAME.json` (`cli`), because a Herdr pane may
+not have the Orca terminal's `PATH`: on Windows, Herdr 0.9.3 builds a pane's `PATH` from the user and
+system environment settings. Consumers use the recorded path while it is an absolute path to a
+program they can run, and look the CLI up again otherwise. On Windows, a CLI that does not answer
+within 10 seconds is killed together with the processes it started.
+
 ## Orca command-line tool
 
 orca-link calls `orca-ide` on Linux, where `orca` is usually the GNOME screen reader, and `orca`
-elsewhere. `ORCA_CLI_COMMAND` overrides the name or path; each orca-link process reads it from its
-own environment, so binders read it in the Orca terminal and consumers in the Herdr pane. Orca sets
-it itself in WSL terminals.
+elsewhere (`orca.exe` or `orca.cmd` on Windows). `ORCA_CLI_COMMAND` overrides the name or path. The
+binder reads it in the Orca terminal and records the resolved path; a consumer reads it from its
+own environment only when the recorded path no longer exists. Orca sets it itself in WSL terminals.
