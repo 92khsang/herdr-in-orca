@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The oldest supported Python and the newest release.
+        python: ["3.11", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Install and run the console script
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check .
+          expected="orca-link $(python -c 'import orca_link; print(orca_link.__version__)')"
+          test "$(orca-link --version)" = "$expected"
+          # A usage error must reach the shell as status 2 through the launcher.
+          status=0
+          orca-link --link || status=$?
+          test "$status" -eq 2
+
+  # The single required check: it fails unless every test job succeeded, so the
+  # branch rule does not depend on matrix job names.
+  ci-ok:
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all test jobs to succeed
+        env:
+          RESULT: ${{ needs.test.result }}
+        run: test "$RESULT" = success

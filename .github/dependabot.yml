@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Workflow actions are pinned to commit SHAs, so Dependabot is the only source
+  # of their updates and security fixes.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    # Keeps Dependabot PR titles valid Conventional Commits headers.
+    commit-message:
+      prefix: ci
