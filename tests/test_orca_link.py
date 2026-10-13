@@ -1,13 +1,16 @@
 import contextlib
+import errno
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 # Import the checkout's module whatever the working directory or -P/-I flags.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -238,6 +241,15 @@ class IdentityTests(unittest.TestCase):
                 _, _, note = self.linked_context(caller, bound)
                 self.assertEqual(note, '')
 
+    def test_context_names_the_link_when_its_terminal_is_gone(self):
+        self.bind_link('it', Path('/a/app'), {'ORCA_PANE_KEY': 'bound', 'ORCA_TERMINAL_HANDLE': 'term'})
+
+        def rpc(*args, env=None):
+            raise M['TerminalGone']('gone')
+        with patch.dict(os.environ, {}, clear=True), patch.dict(M, {'rpc': rpc}):
+            with self.assertRaisesRegex(RuntimeError, 'terminal of link it is gone; run orca-link open it '):
+                M['context'](self.root, 'it')
+
     def test_rpc_runs_the_cli_with_the_given_environment(self):
         env = {'ORCA_CLI_COMMAND': 'orca-test', 'PATH': 'test-path'}
         seen = {}
@@ -253,6 +265,218 @@ class IdentityTests(unittest.TestCase):
             M['rpc']('terminal', 'show', '--terminal', 'h', env=env)
         self.assertEqual(seen['which'], ('orca-test', 'test-path'))
         self.assertEqual(seen['run'], (['resolved-orca', 'terminal', 'show', '--terminal', 'h', '--json'], env))
+
+class HardeningTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_lock_without_retries_never_sleeps(self):
+        held = M['locked'](self.root / 'x.lock')
+        self.addCleanup(held.close)
+        with patch.object(M['time'], 'sleep', side_effect=AssertionError('slept')):
+            with self.assertRaises(M['LinkBusy']):
+                M['locked'](self.root / 'x.lock')
+
+    def test_owners_retry_and_probes_do_not(self):
+        held = M['locked'](self.root / 'it.bind.lock')
+        self.addCleanup(held.close)
+        with patch.object(M['time'], 'sleep', side_effect=AssertionError('probe slept')):
+            self.assertTrue(M['is_bound'](self.root, 'it'))
+        with patch.object(M['time'], 'sleep') as sleep, self.assertRaises(M['LinkBusy']):
+            M['locked'](self.root / 'it.bind.lock', retries=M['LOCK_RETRIES'])
+        self.assertEqual(sleep.call_args_list, [call(0.05)] * 3)
+
+    def test_lock_retries_until_the_holder_releases(self):
+        held = M['locked'](self.root / 'x.lock')
+        with patch.object(M['time'], 'sleep', side_effect=lambda delay: held.close()) as sleep:
+            with M['locked'](self.root / 'x.lock', retries=2):
+                pass
+        sleep.assert_called_once()
+
+    def test_lock_reports_file_errors_as_they_are(self):
+        with self.assertRaises(FileNotFoundError):
+            M['locked'](self.root / 'missing' / 'x.lock')
+
+    @unittest.skipIf(os.name == 'nt', 'flock is POSIX-only')
+    def test_lock_failures_other_than_contention_are_errors(self):
+        with patch.object(M['fcntl'], 'flock', side_effect=OSError(errno.ENOLCK, 'No locks available')):
+            with self.assertRaises(OSError):
+                M['locked'](self.root / 'x.lock')
+
+    def test_binder_retries_its_bind_lock(self):
+        held = M['locked'](self.root / 'it.bind.lock')
+        calls = []
+        with patch.dict(os.environ, {'ORCA_PANE_KEY': 'pane'}, clear=True), \
+             patch.object(M['time'], 'sleep', side_effect=lambda delay: held.close()), \
+             patch.dict(M, {'bind_new': lambda root, name, open_herdr: calls.append(name),
+                            'attach_existing': lambda name: self.fail('reattached')}):
+            M['bind'](self.root, 'it', open_herdr=True)
+        self.assertEqual(calls, ['it'])
+
+    def test_exit_status_on_each_platform(self):
+        with patch.object(M['os'], 'name', 'nt'):
+            nt = [M['exit_status'](rc) for rc in (7, 2**31 - 1, 2**31, 0xC000013A)]
+        with patch.object(M['os'], 'name', 'posix'):
+            posix = [M['exit_status'](rc) for rc in (0, 7, -15, -2)]
+        self.assertEqual(nt, [7, 2**31 - 1, -2**31, 0xC000013A - 2**32])
+        self.assertEqual(posix, [0, 7, 143, 130])
+
+    def fake_child(self, returncode, interrupts=0, timeouts=0, check=lambda: None):
+        """Return a stand-in for Popen that sends SIGINT during its first waits."""
+        class Child:
+            waits = 0
+
+            def poll(self):
+                return getattr(self, 'returncode', None)
+
+            def wait(self, timeout=None):
+                self.waits += 1
+                check()
+                if self.waits <= interrupts:
+                    signal.raise_signal(signal.SIGINT)
+                if self.waits <= interrupts + timeouts:
+                    raise subprocess.TimeoutExpired('tool', timeout)
+                self.returncode = returncode
+                return returncode
+        return Child()
+
+    def run_with(self, child, is_bound=lambda root, name: True, popen=None):
+        with patch.dict(M, {'context': lambda root, name: {}, 'is_bound': is_bound}), \
+             patch.object(M['subprocess'], 'Popen', popen or (lambda *args, **kwargs: child)):
+            return M['run'](self.root, 'test', ['tool'])
+
+    def test_run_ignores_ctrl_c_until_the_command_exits(self):
+        previous = signal.getsignal(signal.SIGINT)
+
+        def run_lock_is_held():
+            with self.assertRaises(M['LinkBusy']):
+                M['locked'](self.root / 'test.run.lock')
+        child = self.fake_child(5, interrupts=2, check=run_lock_is_held)
+        try:
+            self.assertEqual(self.run_with(child), 5)
+        except KeyboardInterrupt:
+            self.fail('Ctrl-C ended run() before the command exited')
+        self.assertEqual(child.waits, 3)
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
+    def test_consumer_retries_its_run_lock(self):
+        held = M['locked'](self.root / 'test.run.lock')
+        with patch.object(M['time'], 'sleep', side_effect=lambda delay: held.close()):
+            self.assertEqual(self.run_with(self.fake_child(0)), 0)
+
+    def test_run_maps_the_command_status(self):
+        returncode = 0xC000013A if os.name == 'nt' else -2
+        self.assertEqual(self.run_with(self.fake_child(returncode)), M['exit_status'](returncode))
+        self.assertNotEqual(M['exit_status'](returncode), returncode)
+
+    def test_run_reports_commands_that_cannot_start(self):
+        cases = ((FileNotFoundError(errno.ENOENT, 'missing'), 127, 'command not found: tool'),
+                 (PermissionError(errno.EACCES, 'denied'), 126, 'cannot run tool: denied'),
+                 (OSError(errno.ENOEXEC, 'Exec format error'), 126, 'cannot run tool: Exec format error'))
+        for error, status, message in cases:
+            with self.subTest(error=error):
+                def popen(*args, **kwargs):
+                    raise error
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self.run_with(None, popen=popen), status)
+                self.assertIn(message, err.getvalue())
+
+    def test_run_reports_a_closed_binding_once(self):
+        def gone(root, name):
+            raise OSError(errno.ENOENT, 'state directory removed')
+        for is_bound in (lambda root, name: False, gone):
+            with self.subTest(is_bound=is_bound):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self.run_with(self.fake_child(0, timeouts=2), is_bound=is_bound), 0)
+                self.assertEqual(err.getvalue().count('binding closed'), 1)
+
+    def test_missing_command_exits_127(self):
+        err = io.StringIO()
+        with patch.dict(M, {'context': lambda root, name: dict(os.environ), 'is_bound': lambda root, name: True}), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(M['run'](self.root, 'test', ['orca-link-test-no-such-command']), 127)
+        self.assertIn('command not found', err.getvalue())
+
+    def rpc_with(self, returncode, stdout):
+        reply = subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=b'')
+
+        def run(*args, **kwargs):
+            # The reply must reach json.loads as bytes, not decoded with the locale.
+            self.assertFalse({'text', 'encoding', 'errors', 'universal_newlines'} & set(kwargs))
+            return reply
+        with patch.dict(M, {'cli': lambda env=None: 'orca-test'}), patch.object(M['subprocess'], 'run', run):
+            return M['rpc']('terminal', 'show')
+
+    def test_rpc_reports_orca_errors_by_code(self):
+        cases = [
+            (1, b'{"ok": false, "error": {"code": "terminal_handle_stale"}}', 'terminal is gone'),
+            (1, b'{"ok": false, "error": {"code": "terminal_gone"}}', 'terminal is gone'),
+            (1, b'{"ok": false, "error": {"code": "runtime_unavailable"}}', 'not running'),
+            (1, b'{"ok": false, "error": {"code": "other_error"}}', r'failed \(other_error\)'),
+            (0, b'not json', 'did not return JSON'),
+            (0, b'[]', 'did not return JSON'),
+        ]
+        for returncode, stdout, message in cases:
+            with self.subTest(stdout=stdout), self.assertRaisesRegex(RuntimeError, message):
+                self.rpc_with(returncode, stdout)
+
+    def test_rpc_accepts_a_reply_without_metadata(self):
+        reply = self.rpc_with(0, b'\xef\xbb\xbf{"ok": true, "_meta": null}')
+        self.assertIsNone(M['runtime_id'](reply))
+
+    def write_binding(self, content, mode=0o600):
+        path = self.root / 'it.json'
+        path.write_text(content)
+        path.chmod(mode)
+
+    def test_load_binding_rejects_invalid_files(self):
+        valid = {'env': {'ORCA_TERMINAL_HANDLE': 'term'}, 'runtime': 'rt', 'project': 'p'}
+        self.write_binding(json.dumps(valid))
+        self.assertEqual(M['load_binding'](self.root, 'it'), valid)
+        for content in ('not json', '[]', '{"env": []}', '{"env": {}}', '{"env": {"ORCA_TERMINAL_HANDLE": 1}}',
+                        '{"env": {"ORCA_TERMINAL_HANDLE": "term"}, "project": 1}'):
+            with self.subTest(content=content):
+                self.write_binding(content)
+                with self.assertRaisesRegex(RuntimeError, 'invalid'):
+                    M['load_binding'](self.root, 'it')
+
+    def binder_env(self):
+        endpoint = self.root / 'endpoint'
+        endpoint.touch()
+        return {'ORCA_PANE_KEY': 'pane', 'ORCA_TERMINAL_HANDLE': 'term', 'ORCA_AGENT_HOOK_ENDPOINT': str(endpoint)}
+
+    def test_bind_removes_a_stale_binding_file_before_checking_orca(self):
+        (self.root / 'it.json').write_text('{"stale": true}')
+        seen = []
+
+        def rpc(*args, env=None):
+            seen.append((self.root / 'it.json').exists())
+            raise RuntimeError('stop')
+        with patch.dict(os.environ, self.binder_env(), clear=True), patch.dict(M, {'rpc': rpc}):
+            with self.assertRaisesRegex(RuntimeError, 'stop'):
+                M['bind'](self.root, 'it')
+        self.assertEqual(seen, [False])
+
+    def test_bind_refuses_a_terminal_that_backs_another_link(self):
+        held = M['locked'](self.root / (hashlib.sha256(b'pane').hexdigest() + '.target.lock'))
+        self.addCleanup(held.close)
+        with patch.dict(os.environ, self.binder_env(), clear=True), \
+             patch.dict(M, {'rpc': lambda *args, env=None: {'_meta': {'runtimeId': 'rt'}}, 'project_root': lambda: self.root}):
+            with self.assertRaisesRegex(RuntimeError, 'already backs another link'):
+                M['bind'](self.root, 'it')
+        self.assertFalse((self.root / 'it.json').exists())
+
+    def test_load_binding_reports_a_missing_or_shared_file(self):
+        with self.assertRaisesRegex(RuntimeError, 'starting or closing'):
+            M['load_binding'](self.root, 'it')
+        if os.name != 'nt':
+            self.write_binding('{}', mode=0o644)
+            with self.assertRaisesRegex(RuntimeError, 'not private'):
+                M['load_binding'](self.root, 'it')
 
 class BindingExitTests(unittest.TestCase):
     def test_reopen_existing_binding_or_orphan_consumer(self):
