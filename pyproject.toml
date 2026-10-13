@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orca-link"
+dynamic = ["version"]
+description = "Run Herdr inside Orca and connect agents started in Herdr panes to Orca's agent hooks"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+Repository = "https://github.com/92khsang/herdr-in-orca"
+
+[project.scripts]
+orca-link = "orca_link:main"
+
+[tool.hatch.version]
+path = "orca_link.py"
+
+# List sdist contents explicitly: hatchling reads only this repository's .gitignore,
+# so untracked local files would otherwise be packaged from a working checkout.
+[tool.hatch.build.targets.sdist]
+include = ["/orca_link.py", "/tests", "/docs"]
