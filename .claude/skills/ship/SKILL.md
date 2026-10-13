@@ -12,7 +12,8 @@ Follow the branch, title and body rules in `AGENTS.md` under Contributing. From 
 3. Stage only the intended files with explicit `git add <path>...`, never `git add -A` or `.`, and
    commit with a Conventional Commits header.
 4. `git push -u origin HEAD`.
-5. Write the PR body to a file as the future commit body, then
+5. Write the PR body to a file as the future commit body, with lines of at most 72 characters
+   (GitHub rewraps longer lines in the squash commit), then
    `gh pr create --base main --title "<header>" --body-file <file>`.
 6. Post the verification (commands run, pass counts, OS and Python versions) with
    `gh pr comment <n> --body-file <file>`.
